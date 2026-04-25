@@ -22,6 +22,7 @@
 #include <linux/input/mt.h>
 #include <linux/workqueue.h>
 #include <linux/atomic.h>
+#include <linux/spinlock.h>
 #include <linux/fixp-arith.h>
 #include <linux/version.h>
 /*
@@ -547,7 +548,9 @@ static int hidpp_send_fap_command_sync(struct hidpp_device *hidpp,
 	 * reports and only responds to SHORT. It always responds with VERY_LONG
 	 * (0x12) regardless of input report type. Use SHORT when possible.
 	 */
-	if ((hidpp->quirks & HIDPP_QUIRK_RS50_FFB) &&
+	if (((hidpp->quirks & HIDPP_QUIRK_RS50_FFB) ||
+	     hidpp->hid_dev->product == USB_DEVICE_ID_LOGITECH_G_PRO_WHEEL ||
+	     hidpp->hid_dev->product == USB_DEVICE_ID_LOGITECH_G_PRO_PS_WHEEL) &&
 	    param_count <= (HIDPP_REPORT_SHORT_LENGTH - 4))
 		message->report_id = REPORT_ID_HIDPP_SHORT;
 	else if (param_count > (HIDPP_REPORT_LONG_LENGTH - 4))
@@ -2637,6 +2640,8 @@ struct hidpp_ff_private_data {
 	int *effect_ids;
 	struct workqueue_struct *wq;
 	atomic_t workqueue_size;
+	spinlock_t lock;
+	struct hidpp_ff_work_data **pending_work;
 };
 
 struct hidpp_ff_work_data {
@@ -2696,31 +2701,59 @@ static u8 hidpp_ff_find_effect(struct hidpp_ff_private_data *data, int effect_id
 	return 0;
 }
 
+static int hidpp_ff_get_pending_idx(int effect_id, u8 command, int num_effects)
+{
+	if (effect_id >= 0)
+		return effect_id;
+	if (effect_id == HIDPP_FF_EFFECTID_AUTOCENTER)
+		return num_effects;
+	if (command == HIDPP_FF_SET_GLOBAL_GAINS)
+		return num_effects + 1;
+	if (command == HIDPP_FF_SET_APERTURE)
+		return num_effects + 2;
+	return -1;
+}
+
 static void hidpp_ff_work_handler(struct work_struct *w)
 {
 	struct hidpp_ff_work_data *wd = container_of(w, struct hidpp_ff_work_data, work);
 	struct hidpp_ff_private_data *data = wd->data;
 	struct hidpp_report response;
-	u8 slot;
-	int ret;
+	u8 params[HIDPP_FF_MAX_PARAMS];
+	u8 size;
+	int ret, idx;
+	unsigned long flags;
+
+	/*
+	 * Copy params to local buffer and clear pending work pointer.
+	 * This allows the next update to queue a new work item while
+	 * this one is still sending.
+	 */
+	spin_lock_irqsave(&data->lock, flags);
+	memcpy(params, wd->params, wd->size);
+	size = wd->size;
+	idx = hidpp_ff_get_pending_idx(wd->effect_id, wd->command, data->num_effects);
+	if (idx >= 0 && data->pending_work[idx] == wd)
+		data->pending_work[idx] = NULL;
+	spin_unlock_irqrestore(&data->lock, flags);
 
 	/* add slot number if needed */
 	switch (wd->effect_id) {
 	case HIDPP_FF_EFFECTID_AUTOCENTER:
-		wd->params[0] = data->slot_autocenter;
+		params[0] = data->slot_autocenter;
 		break;
 	case HIDPP_FF_EFFECTID_NONE:
 		/* leave slot as zero */
 		break;
 	default:
 		/* find current slot for effect */
-		wd->params[0] = hidpp_ff_find_effect(data, wd->effect_id);
+		params[0] = hidpp_ff_find_effect(data, wd->effect_id);
 		break;
 	}
 
 	/* send command and wait for reply */
 	ret = hidpp_send_fap_command_sync(data->hidpp, data->feature_index,
-		wd->command, wd->params, wd->size, &response);
+		wd->command, params, size, &response);
 
 	if (ret) {
 		hid_err(data->hidpp->hid_dev, "Failed to send command to device!\n");
@@ -2730,8 +2763,8 @@ static void hidpp_ff_work_handler(struct work_struct *w)
 	/* parse return data */
 	switch (wd->command) {
 	case HIDPP_FF_DOWNLOAD_EFFECT:
-		slot = response.fap.params[0];
-		if (slot > 0 && slot <= data->num_effects) {
+		if (response.fap.params[0] > 0 && response.fap.params[0] <= data->num_effects) {
+			u8 slot = response.fap.params[0];
 			if (wd->effect_id >= 0)
 				/* regular effect uploaded */
 				data->effect_ids[slot-1] = wd->effect_id;
@@ -2741,18 +2774,18 @@ static void hidpp_ff_work_handler(struct work_struct *w)
 		}
 		break;
 	case HIDPP_FF_DESTROY_EFFECT:
-		if (wd->effect_id >= 0)
+		if (wd->effect_id >= 0 && params[0] > 0 && params[0] <= data->num_effects)
 			/* regular effect destroyed */
-			data->effect_ids[wd->params[0]-1] = -1;
+			data->effect_ids[params[0]-1] = -1;
 		else if (wd->effect_id >= HIDPP_FF_EFFECTID_AUTOCENTER)
 			/* autocenter spring destroyed */
 			data->slot_autocenter = 0;
 		break;
 	case HIDPP_FF_SET_GLOBAL_GAINS:
-		data->gain = (wd->params[0] << 8) + wd->params[1];
+		data->gain = (params[0] << 8) + params[1];
 		break;
 	case HIDPP_FF_SET_APERTURE:
-		data->range = (wd->params[0] << 8) + wd->params[1];
+		data->range = (params[0] << 8) + params[1];
 		break;
 	default:
 		/* no action needed */
@@ -2766,9 +2799,34 @@ out:
 
 static int hidpp_ff_queue_work(struct hidpp_ff_private_data *data, int effect_id, u8 command, u8 *params, u8 size)
 {
-	struct hidpp_ff_work_data *wd = kzalloc(sizeof(*wd), GFP_KERNEL);
-	int s;
+	struct hidpp_ff_work_data *wd;
+	int s, idx;
+	unsigned long flags;
 
+	/*
+	 * For high-frequency updates (download/gains/aperture), merge with
+	 * existing pending work if any. This prevents the command queue
+	 * from growing indefinitely when games send updates faster than
+	 * the device can process them.
+	 */
+	if (command == HIDPP_FF_DOWNLOAD_EFFECT ||
+	    command == HIDPP_FF_SET_GLOBAL_GAINS ||
+	    command == HIDPP_FF_SET_APERTURE) {
+		idx = hidpp_ff_get_pending_idx(effect_id, command, data->num_effects);
+		if (idx >= 0) {
+			spin_lock_irqsave(&data->lock, flags);
+			if (data->pending_work[idx]) {
+				wd = data->pending_work[idx];
+				memcpy(wd->params, params, size);
+				wd->size = size;
+				spin_unlock_irqrestore(&data->lock, flags);
+				return 0;
+			}
+			spin_unlock_irqrestore(&data->lock, flags);
+		}
+	}
+
+	wd = kzalloc(sizeof(*wd), GFP_ATOMIC);
 	if (!wd)
 		return -ENOMEM;
 
@@ -2779,6 +2837,17 @@ static int hidpp_ff_queue_work(struct hidpp_ff_private_data *data, int effect_id
 	wd->command = command;
 	wd->size = size;
 	memcpy(wd->params, params, size);
+
+	if (command == HIDPP_FF_DOWNLOAD_EFFECT ||
+	    command == HIDPP_FF_SET_GLOBAL_GAINS ||
+	    command == HIDPP_FF_SET_APERTURE) {
+		idx = hidpp_ff_get_pending_idx(effect_id, command, data->num_effects);
+		if (idx >= 0) {
+			spin_lock_irqsave(&data->lock, flags);
+			data->pending_work[idx] = wd;
+			spin_unlock_irqrestore(&data->lock, flags);
+		}
+	}
 
 	s = atomic_inc_return(&data->workqueue_size);
 	queue_work(data->wq, &wd->work);
@@ -3091,6 +3160,7 @@ static void hidpp_ff_destroy(struct ff_device *ff)
 	device_remove_file(&hid->dev, &dev_attr_range);
 	destroy_workqueue(data->wq);
 	kfree(data->effect_ids);
+	kfree(data->pending_work);
 }
 
 static int hidpp_ff_init(struct hidpp_device *hidpp,
@@ -3198,8 +3268,16 @@ static int hidpp_ff_init(struct hidpp_device *hidpp,
 		kfree(data);
 		return -ENOMEM;
 	}
+	data->pending_work = kcalloc(num_slots + 3, sizeof(struct hidpp_ff_work_data *), GFP_KERNEL);
+	if (!data->pending_work) {
+		kfree(data->effect_ids);
+		kfree(data);
+		return -ENOMEM;
+	}
+	spin_lock_init(&data->lock);
 	data->wq = create_singlethread_workqueue("hidpp-ff-sendqueue");
 	if (!data->wq) {
+		kfree(data->pending_work);
 		kfree(data->effect_ids);
 		kfree(data);
 		return -ENOMEM;
@@ -12321,10 +12399,10 @@ static const struct hid_device_id hidpp_devices[] = {
 		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
 	{ /* Logitech G Pro Racing Wheel (Xbox/PC) over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G_PRO_WHEEL),
-		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
+		.driver_data = HIDPP_QUIRK_CLASS_G920 },
 	{ /* Logitech G Pro Racing Wheel (PlayStation/PC) over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G_PRO_PS_WHEEL),
-		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
+		.driver_data = HIDPP_QUIRK_CLASS_G920 },
 	{ /* Logitech RS50 Direct Drive Wheel (PlayStation/PC) over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_RS50),
 		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_RS50_FFB },
