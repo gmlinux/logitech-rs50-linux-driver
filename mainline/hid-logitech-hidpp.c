@@ -5583,6 +5583,8 @@ static void rs50_lightsync_query_slot_configs(struct hidpp_device *hidpp,
 					      struct rs50_ff_data *ff);
 static int rs50_lightsync_apply_slot(struct hidpp_device *hidpp,
 				     struct rs50_ff_data *ff, u8 slot);
+static void rs50_lightsync_query_state(struct hidpp_device *hidpp,
+				       struct rs50_ff_data *ff);
 
 /*
  * Query current device settings using discovered feature indices.
@@ -5601,7 +5603,7 @@ static void rs50_ff_query_common_settings(struct rs50_ff_data *ff)
 	struct hid_device *hid = hidpp->hid_dev;
 	struct hidpp_report response;
 	u8 params[3] = {0, 0, 0};
-	int ret;
+	int ret, i;
 	u16 value;
 
 	if (ff->idx_range != RS50_FEATURE_NOT_FOUND) {
@@ -5687,6 +5689,10 @@ static void rs50_ff_query_common_settings(struct rs50_ff_data *ff)
 			ff->led_brightness = val;
 			hid_dbg(hid, "Wheel: LED brightness = %d%%\n", val);
 
+			/* Update per-slot cache so the first apply doesn't stomp device state (SYS.F16) */
+			for (i = 0; i < RS50_LIGHTSYNC_NUM_SLOTS; i++)
+				ff->led_slots[i].brightness = val;
+
 			if (ff->mode_known && ff->current_mode == 0) {
 				ff->sensitivity = val;
 				hid_dbg(hid, "Wheel: sensitivity = %d%%\n", val);
@@ -5732,16 +5738,31 @@ static void rs50_ff_query_settings(struct rs50_ff_data *ff)
 			rs50_lightsync_query_slot_configs(hidpp, ff);
 
 			/*
+			 * Query current effect mode and active slot so we don't
+			 * stomp the wheel's state during initialization (SYS.F17).
+			 */
+			rs50_lightsync_query_state(hidpp, ff);
+
+			/*
 			 * After enabling, send initial configuration to the device.
 			 * Without this, LEDs are enabled but have no config, staying dark.
 			 * The sequence must be: enable (0x6C) -> set config (0x2C) -> activate (0x3C)
+			 *
+			 * If the wheel is in an animated mode (1-4), skip apply_slot
+			 * because it would force mode 5 (custom).
 			 */
-			hid_dbg(hid, "RS50: Sending initial LED configuration\n");
-			ret = rs50_lightsync_apply_slot(hidpp, ff, ff->led_active_slot);
-			if (ret)
-				hid_warn(hid, "RS50: Failed to apply initial LED config: %d\n", ret);
-			else
-				hid_dbg(hid, "RS50: Initial LED configuration applied\n");
+			if (ff->led_effect == 5) {
+				hid_dbg(hid, "RS50: Sending initial LED configuration (slot %u)\n",
+					ff->led_active_slot);
+				ret = rs50_lightsync_apply_slot(hidpp, ff, ff->led_active_slot);
+				if (ret)
+					hid_warn(hid, "RS50: Failed to apply initial LED config: %d\n", ret);
+				else
+					hid_dbg(hid, "RS50: Initial LED configuration applied\n");
+			} else {
+				hid_dbg(hid, "RS50: Skipping initial LED config (mode %u active)\n",
+					ff->led_effect);
+			}
 		}
 	}
 }
@@ -7124,6 +7145,50 @@ static void rs50_lightsync_query_slot_configs(struct hidpp_device *hidpp,
 
 	for (i = 0; i < RS50_LIGHTSYNC_NUM_SLOTS; i++)
 		rs50_lightsync_get_slot_config(hidpp, ff, i);
+}
+
+/*
+ * Query current LIGHTSYNC state (effect mode and active slot) from device.
+ * Closes SYS.F17: without this the driver defaults to slot 0 / mode 5 (custom)
+ * and stomps any profile-driven state on the wheel during init or re-query.
+ */
+static void rs50_lightsync_query_state(struct hidpp_device *hidpp,
+				       struct rs50_ff_data *ff)
+{
+	struct hid_device *hid = hidpp->hid_dev;
+	struct hidpp_report response;
+	u8 params[3] = {0, 0, 0};
+	int ret;
+
+	if (ff->idx_lightsync != RS50_FEATURE_NOT_FOUND) {
+		/* fn2: GET_STATE returns current effect mode in params[0] */
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_lightsync,
+						  RS50_LIGHTSYNC_FN_GET_STATE,
+						  params, 0, &response);
+		if (ret == 0) {
+			u8 mode = response.fap.params[0];
+
+			if (mode >= 1 && mode <= 5) {
+				WRITE_ONCE(ff->led_effect, mode);
+				hid_dbg(hid, "RS50: LIGHTSYNC effect mode = %u\n", mode);
+			}
+		}
+	}
+
+	if (ff->idx_rgb_config != RS50_FEATURE_NOT_FOUND) {
+		/* fn3: ACTIVATE returns current active slot in params[0] when called with no params */
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_rgb_config,
+						  RS50_RGB_FN_ACTIVATE,
+						  params, 0, &response);
+		if (ret == 0) {
+			u8 slot = response.fap.params[0];
+
+			if (slot < RS50_LIGHTSYNC_NUM_SLOTS) {
+				WRITE_ONCE(ff->led_active_slot, slot);
+				hid_dbg(hid, "RS50: LIGHTSYNC active slot = %u\n", slot);
+			}
+		}
+	}
 }
 
 /*
@@ -9001,6 +9066,7 @@ static int gpro_sysfs_init(struct hidpp_device *hidpp)
 	ff->ffb_filter = 11;
 	ff->ffb_filter_auto = 0;
 	ff->led_brightness = 100;
+	ff->sensitivity = 100;
 
 	/*
 	 * LIGHTSYNC slot defaults: mirror the RS50 path (white, 100%).
@@ -9128,6 +9194,7 @@ static int rs50_ff_init(struct hidpp_device *hidpp)
 	ff->ffb_filter = 11;	/* Default: ~mid-range */
 	ff->ffb_filter_auto = 0;/* Default: off */
 	ff->led_brightness = 100;/* Default: 100% */
+	ff->sensitivity = 100;	 /* Default: 100% */
 	ff->led_effect = 5;	/* Default: 5=custom mode (shows custom slot colors) */
 
 	/* Initialize LIGHTSYNC slots with default white LEDs */
